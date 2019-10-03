@@ -1,0 +1,265 @@
+#!/usr/bin/python3
+
+import argparse
+import curses
+from functools import wraps
+from datetime import datetime
+import time
+import subprocess
+import threading
+
+
+def infinite_loop(func):
+    """Decorator to convert the target function into an infinite loop that can be broken with a KeyboardInterrupt."""
+    @wraps(func)  # Preserve target's metadata
+    def wrapper(*args, **kwargs):
+        while True:
+            try:
+                func(*args, **kwargs)
+            except KeyboardInterrupt:
+                break
+    return wrapper
+
+
+class PyWatch:
+    """
+    Python command to mimic Unix's "watch" command.
+    Adds additional functionality including scrolling, paging and iterating though multiple commands (see examples).
+    As an indicator, the header is displayed in CYAN when "Cycling" mode is active.
+
+    To scroll we need to write to the screen independently from the "interval" time between commands.
+    In order to do this, the target command is run in a separate thread, which updates the "output" attribute.
+    The main display loop runs with a much smaller delay, reading the latest output and checking for user input.
+
+    It should be able to handle dynamic terminal resizing, including height, width & zoom in/out.
+
+    Controls:
+        - UP/DOWN arrows: Scroll
+        - LEFT/RIGHT arrows: Paging (prev, next)
+        - Mouse wheel: Scroll
+        - PageUp/PageDown: Paging
+        - Home/End: Top/bottom of command output
+        - Tab/Ctrl+Tab: Switch to next/previous command
+        - C: Activate/deactivate "cycling" mode
+
+    Basic Use:
+        ```
+        with CurseManager() as screen:
+            watcher = PyWatcher(screen, command, interval)
+            watcher.run()
+        ```
+
+    Examples:
+        ```
+        pywatch echo Hello World  # Default 1 sec interval
+
+        pywatch -n .5 "cat long_logfile.log"  # Set interval to half a second
+
+        pywatch "echo Hello World && echo Foo Bar"  # Two commands we can switch between (default 5 secs)
+
+        pywatch -c 10 "cat long_logfile.log && echo Hello World" --cycle  # Set cycle time and begin cycling
+        ```
+
+    Attributes:
+        :param screen (curses.window): Curses screen to write to
+        :param command (List[str]): Command to run e.g. ['echo', 'Hello', 'World'], ['echo', 'Hello World']...
+        :param interval (float): Seconds between command updates
+        :param cycle_interval (float): Seconds between command cycling (within "cycling" mode)
+        :param cycle (bool): Initial "cycling" mode
+
+    TODO:
+        - Add independent scrolling for each command?
+
+    FIMXE:
+        - Error check for invalid command
+    """
+
+    def __init__(self, screen, commands, interval=1.0, cycle_interval=5.0, cycle=False):
+        """Set PyWatcher parameters and prepare commands for execution."""
+        self.screen = screen
+        self.interval = interval  # Seconds
+        self.cycle_interval = cycle_interval  # Seconds
+
+        self.commands_str = [com.strip() for com in ' '.join(commands).split('&&')]  # Format for printing
+        self.commands = [com.split() for com in self.commands_str]  # Format for subprocess
+        self.outputs = [None]*len(self)  # Latest command outputs
+
+        self.top_line = 0  # Line from which to write command output i.e. scrolling line
+        self.cycling = cycle  # Cycling mode flag
+        self.current_idx = -1 if self.cycling else 0  # Active command
+        self.time_pad = len(self.time_str)  # For header padding
+
+    def __len__(self):
+        """Return the number of commands available to run."""
+        return len(self.commands)
+
+    @property
+    def time_str(self):
+        """Return the formatted current time."""
+        return datetime.now().strftime('%c')
+
+    @property
+    def max_line(self):
+        """Access screen height as a property to ensure it's updated if resized."""
+        return self.screen.getmaxyx()[0] - 2  # Account for header size
+
+    @property
+    def max_col(self):
+        """Access screen width as a property to ensure it's updated if resized."""
+        return self.screen.getmaxyx()[1]
+
+    @property
+    def base_color(self):
+        """Return Curses base color based on the current mode."""
+        return curses.color_pair(3) if self.cycling else curses.color_pair(1)
+
+    @property
+    def highlight_color(self):
+        """Return Curses highlighting color based on the current mode."""
+        return curses.color_pair(4) if self.cycling else curses.color_pair(2)
+
+    def run(self):
+        """Initialize threads and run the main display loop."""
+        threading.Thread(target=self._get_output, daemon=True).start()  # Run selected command
+        threading.Thread(target=self._cycle_loop, daemon=True).start()  # Cycle between commands
+
+        self._display_loop()
+
+    @infinite_loop
+    def _display_loop(self):
+        """Display command information and command output."""
+        self.screen.clear()
+
+        # Commands header & highlight current command
+        self.screen.addstr(f'Every {self.interval:.1f}/{self.cycle_interval:.1f}s: | ', self.base_color)
+        for i, command in enumerate(self.commands_str):
+            self.screen.addstr(command, self.highlight_color if i == self.current_idx else self.base_color)
+            self.screen.addstr(' | ', self.base_color)  # Pad between commands
+
+        # Add current date & time to header
+        pad = self.max_col - self.screen.getyx()[-1] - self.time_pad
+        self.screen.addstr(f'{" "*pad}{self.time_str}\n', self.base_color)
+
+        # Perform actions based on user input and display the current command's output
+        self._handle_input(self.screen.getch())
+        self._display_command()
+
+        self.screen.refresh()  # Refresh must go before delay!
+        time.sleep(0.01)  # Small delay to avoid stuttering but allow for smooth scrolling
+
+    @infinite_loop
+    def _get_output(self):
+        """Update the current command's output every "interval" seconds."""
+        idx = self.current_idx  # Local copy to avoid race condition updates
+
+        try:  # Default case: Return the command output
+            self.outputs[idx] = subprocess.check_output(self.commands[idx], stderr=subprocess.STDOUT).splitlines()
+        except subprocess.CalledProcessError as e:  # Command error: Return error message
+            self.outputs[idx] = e.output.splitlines()
+
+        time.sleep(self.interval)
+
+    @infinite_loop
+    def _cycle_loop(self):
+        """Control the current command when in cycling mode."""
+        cycle, idx = self.cycling, self.current_idx  # Local copy to avoid race condition updates
+
+        if cycle:  # Iterate to next command
+            idx = (idx+1) % len(self)
+            self.current_idx = idx
+
+        time.sleep(self.cycle_interval)
+
+    def _display_command(self):
+        """Read the output from the target command and display only the section we've "scrolled" to"""
+        output = self.outputs[self.current_idx]  # Local copy to avoid race condition updates
+        if output is None:
+            self.screen.addstr('Waiting for command...')
+            return
+
+        # Set row limits
+        self.top_line = 0 if len(output) < self.max_line else min(max(self.top_line, 0), len(output)-self.max_line)
+        bottom_line = min(self.top_line+self.max_line, len(output))  # Last page may not be full
+
+        # Crop output to fit screen height & width
+        output = [line[:self.max_col-1] for line in output[self.top_line:bottom_line]]
+        self.screen.addstr(b'\n'.join(output))
+
+    def _handle_input(self, key_in):
+        """Handle user input, i.e. scrolling, paging, cycling..."""
+        # Top/bottom of command: Home/End keys
+        if key_in == curses.KEY_HOME:
+            self.top_line = 0
+        elif key_in == curses.KEY_END:
+            self.top_line = 10_000  # Arbitrary large number
+
+        # Scrolling: U/D arrows + mouse wheel
+        elif key_in == curses.KEY_UP:
+            self.top_line -= 1
+        elif key_in == curses.KEY_DOWN:
+            self.top_line += 1
+
+        # Paging: L/R arrows + PageUp/PageDown keys
+        elif key_in == curses.KEY_LEFT or key_in == curses.KEY_PPAGE:
+            self.top_line -= self.max_line
+        elif key_in == curses.KEY_RIGHT or key_in == curses.KEY_NPAGE:
+            self.top_line += self.max_line
+
+        # Command cycling commands
+        elif key_in == ord('\t') and not self.cycling:
+            self.current_idx = (self.current_idx + 1) % len(self)
+        elif key_in == curses.KEY_BTAB and not self.cycling:
+            self.current_idx = (self.current_idx - 1) % len(self)
+
+        # Activate/deactivate cycling mode
+        elif key_in == ord('c') or key_in == ord('C'):
+            self.cycling = not self.cycling
+
+
+class CurseManager:
+    """
+    Curses window context manager.
+    Ensures proper cleanup so terminal functionality is restored on exit.
+
+    Example:
+        with CurseManager() as screen:
+            screen.addstr('Hello World')
+    """
+    def __init__(self):
+        self.stdscr = None
+
+    def __enter__(self):
+        """Create screen and setup properties."""
+        self.stdscr = curses.initscr()
+        curses.noecho()             # Don't display pressed keys
+        curses.cbreak()             # React to keys without Enter press
+        self.stdscr.keypad(True)    # Use keypad & navigation keys
+        self.stdscr.nodelay(True)   # Non-blocking input reading
+        curses.start_color()        # Enable coloured outputs
+        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK)  # Color as (FG, BG)
+        curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)
+        curses.init_pair(3, curses.COLOR_CYAN, curses.COLOR_BLACK)
+        curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        return self.stdscr
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Restore terminal settings and close window."""
+        self.stdscr.keypad(False)
+        self.stdscr.nodelay(False)
+        curses.echo()
+        curses.nocbreak()
+        curses.endwin()
+
+
+if __name__ == '__main__':
+    # Argument parser
+    parser = argparse.ArgumentParser(description='Watch command with scrolling capabilities')
+    parser.add_argument('command', nargs='+', help='Command to run e.g. "echo Hello World".')
+    parser.add_argument('-n', '--interval', default=1, type=float, help='Seconds between updates (can be fraction).')
+    parser.add_argument('-c', '--cycle-interval', default=5, type=float, help='Seconds between command cycling.')
+    parser.add_argument('--cycle', action='store_true', help='Begin in "cycling" mode.')
+
+    # Run PyWatch
+    cl_args = parser.parse_args()
+    with CurseManager() as stdscr:
+        PyWatch(stdscr, cl_args.command, cl_args.interval, cl_args.cycle_interval, cl_args.cycle).run()
