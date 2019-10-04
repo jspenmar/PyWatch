@@ -73,6 +73,7 @@ class PyWatch:
     FIMXE:
         - Error check for invalid command
     """
+    DELAY = 0.02
 
     def __init__(self, screen, commands, interval=1.0, cycle_interval=5.0, cycle=False):
         """Set PyWatcher parameters and prepare commands for execution."""
@@ -145,7 +146,7 @@ class PyWatch:
         self._display_command()
 
         self.screen.refresh()  # Refresh must go before delay!
-        time.sleep(0.01)  # Small delay to avoid stuttering but allow for smooth scrolling
+        time.sleep(self.DELAY)  # Small delay to avoid stuttering but allow for smooth scrolling
 
     @infinite_loop
     def _get_output(self):
