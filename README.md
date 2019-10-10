@@ -5,20 +5,11 @@ It provides additional functionality to allow for scrolling, paging and cycling 
 It should also be able to handle dynamic terminal resizing, including height, width & in/out zooming.
 
 ## Requirements
-- Python >= 3.6
+- Python >= 3.x
 - Tested on Ubuntu 16.04
 - Tested on the default terminal, [Yakuake](https://kde.org/applications/system/org.kde.yakuake) and [Terminator](https://gnometerminator.blogspot.com/p/introduction.html)
 
-WARNING: By default uses ```!#/usr/bin/python3``` as the interpreter. 
-If this is not >= 3.6 you will get the error shown below or a similar syntax error (i.e. something complaining about _f-strings_).
-If this is the case, change the interpreter at the top of [pywatch](pywatch) or replace the _f-strings_.
-
-```
-  File "./pywatch", line 127
-    self.screen.addstr(f'Every {self.interval:.1f}/{self.cycle_interval:.1f}s: | ', self.base_color)
-                                                                                 ^
-SyntaxError: invalid syntax
-```
+Update: Removed all Python >= 3.6 requirements. It should now run with any version of Python 3.
 
 ## Usage
 - Remember to make the file executable: `chmod +x path/to/scripts/pywatch`
@@ -48,8 +39,11 @@ pywatch -c 10 "cat long_logfile.log && echo Hello World" --cycle
 + **Top/bottom of command**: Home/End keys
 + **Cycle between commands**: Tab/Ctrl+Tab keys
 + **Toggle cycling mode**: C key
++ **Change refresh interval**: I key + enter the new interval time
 
-As an indicator, the header is displayed in CYAN when "Cycling" mode is active.
+##### Additional Notes:
++ As an indicator, the header is displayed in CYAN when "Cycling" mode is active.
++ The TextBox used to change interval time uses Emacs bindings (which I don't think can be changed), e.g. to delete use Ctrl+H
 
 
 ### Licence

@@ -2,7 +2,9 @@
 
 import argparse
 import curses
+from curses.textpad import Textbox, rectangle
 from functools import wraps
+from contextlib import suppress
 from datetime import datetime
 import time
 import subprocess
@@ -41,6 +43,7 @@ class PyWatch:
         - Home/End: Top/bottom of command output
         - Tab/Ctrl+Tab: Switch to next/previous command
         - C: Activate/deactivate "cycling" mode
+        - I: Change command refresh interval
 
     Basic Use:
         ```
@@ -66,12 +69,6 @@ class PyWatch:
         :param interval (float): Seconds between command updates
         :param cycle_interval (float): Seconds between command cycling (within "cycling" mode)
         :param cycle (bool): Initial "cycling" mode
-
-    TODO:
-        - Add independent scrolling for each command?
-
-    FIMXE:
-        - Error check for invalid command
     """
     DELAY = 0.02
 
@@ -83,12 +80,14 @@ class PyWatch:
 
         self.commands_str = [com.strip() for com in ' '.join(commands).split('&&')]  # Format for printing
         self.commands = [com.split() for com in self.commands_str]  # Format for subprocess
-        self.outputs = [None]*len(self)  # Latest command outputs
 
-        self.top_line = 0  # Line from which to write command output i.e. scrolling line
+        self.outputs = [None]*len(self)  # Latest command outputs
+        self.top_lines = [0]*len(self)  # Lines from which to write command output i.e. scrolling line
+
         self.cycling = cycle  # Cycling mode flag
         self.current_idx = -1 if self.cycling else 0  # Active command
         self.time_pad = len(self.time_str)  # For header padding
+        self.updated = False  # Check if we need to update the screen
 
     def __len__(self):
         """Return the number of commands available to run."""
@@ -129,24 +128,30 @@ class PyWatch:
     @infinite_loop
     def _display_loop(self):
         """Display command information and command output."""
-        self.screen.clear()
-
-        # Commands header & highlight current command
-        self.screen.addstr(f'Every {self.interval:.1f}/{self.cycle_interval:.1f}s: | ', self.base_color)
-        for i, command in enumerate(self.commands_str):
-            self.screen.addstr(command, self.highlight_color if i == self.current_idx else self.base_color)
-            self.screen.addstr(' | ', self.base_color)  # Pad between commands
-
-        # Add current date & time to header
-        pad = self.max_col - self.screen.getyx()[-1] - self.time_pad
-        self.screen.addstr(f'{" "*pad}{self.time_str}\n', self.base_color)
-
-        # Perform actions based on user input and display the current command's output
+        # Get & handle user input
         self._handle_input(self.screen.getch())
-        self._display_command()
 
-        self.screen.refresh()  # Refresh must go before delay!
-        time.sleep(self.DELAY)  # Small delay to avoid stuttering but allow for smooth scrolling
+        # Only update if there's something to do - Improves performance drastically
+        if self.updated:
+            # Reset screen
+            self.screen.clear()
+            self.updated = False
+
+            # Commands header & highlight current command
+            self.screen.addstr('Every {:.1f}/{:.1f}s: | '.format(self.interval, self.cycle_interval), self.base_color)
+            for i, command in enumerate(self.commands_str):
+                self.screen.addstr(command, self.highlight_color if i == self.current_idx else self.base_color)
+                self.screen.addstr(' | ', self.base_color)  # Pad between commands
+
+            # Add current date & time to header, pad to end of the line based on current position
+            pad = self.max_col - self.screen.getyx()[-1] - self.time_pad
+            self.screen.addstr(' '*pad + self.time_str + '\n', self.base_color)
+
+            # Display the current command's output
+            self._display_command()
+
+            self.screen.refresh()  # Refresh must go before delay!
+            time.sleep(self.DELAY)  # Small delay to avoid stuttering but allow for smooth scrolling
 
     @infinite_loop
     def _get_output(self):
@@ -158,6 +163,7 @@ class PyWatch:
         except subprocess.CalledProcessError as e:  # Command error: Return error message
             self.outputs[idx] = e.output.splitlines()
 
+        self.updated = True
         time.sleep(self.interval)
 
     @infinite_loop
@@ -168,53 +174,79 @@ class PyWatch:
         if cycle:  # Iterate to next command
             idx = (idx+1) % len(self)
             self.current_idx = idx
+            self.updated = True
 
         time.sleep(self.cycle_interval)
 
     def _display_command(self):
         """Read the output from the target command and display only the section we've "scrolled" to"""
-        output = self.outputs[self.current_idx]  # Local copy to avoid race condition updates
+        idx = self.current_idx  # Local copy to avoid race condition updates
+        output = self.outputs[idx]
         if output is None:
-            self.screen.addstr('Waiting for command...')
+            self.screen.addstr('Waiting for command to run...')
             return
 
         # Set row limits
-        self.top_line = 0 if len(output) < self.max_line else min(max(self.top_line, 0), len(output)-self.max_line)
-        bottom_line = min(self.top_line+self.max_line, len(output))  # Last page may not be full
+        top_line = self.top_lines[idx]
+        top_line = 0 if len(output) < self.max_line else min(max(top_line, 0), len(output)-self.max_line)
+        bottom_line = min(top_line+self.max_line, len(output))  # Last page may not be full
+        self.top_lines[idx] = top_line
 
         # Crop output to fit screen height & width
-        output = [line[:self.max_col-1] for line in output[self.top_line:bottom_line]]
+        output = [line[:self.max_col-1] for line in output[top_line:bottom_line]]
         self.screen.addstr(b'\n'.join(output))
 
     def _handle_input(self, key_in):
         """Handle user input, i.e. scrolling, paging, cycling..."""
+        idx = self.current_idx
+        if key_in != -1:
+            self.updated = True
+
         # Top/bottom of command: Home/End keys
         if key_in == curses.KEY_HOME:
-            self.top_line = 0
+            self.top_lines[idx] = 0
         elif key_in == curses.KEY_END:
-            self.top_line = 10_000  # Arbitrary large number
+            self.top_lines[idx] = 10000  # Arbitrary large number
 
         # Scrolling: U/D arrows + mouse wheel
         elif key_in == curses.KEY_UP:
-            self.top_line -= 1
+            self.top_lines[idx] -= 1
         elif key_in == curses.KEY_DOWN:
-            self.top_line += 1
+            self.top_lines[idx] += 1
 
         # Paging: L/R arrows + PageUp/PageDown keys
         elif key_in == curses.KEY_LEFT or key_in == curses.KEY_PPAGE:
-            self.top_line -= self.max_line
+            self.top_lines[idx] -= self.max_line
         elif key_in == curses.KEY_RIGHT or key_in == curses.KEY_NPAGE:
-            self.top_line += self.max_line
+            self.top_lines[idx] += self.max_line
 
-        # Command cycling commands
+        # Command cycling
         elif key_in == ord('\t') and not self.cycling:
-            self.current_idx = (self.current_idx + 1) % len(self)
+            self.current_idx = (idx+1) % len(self)
         elif key_in == curses.KEY_BTAB and not self.cycling:
-            self.current_idx = (self.current_idx - 1) % len(self)
+            self.current_idx = (idx-1) % len(self)
 
         # Activate/deactivate cycling mode
         elif key_in == ord('c') or key_in == ord('C'):
             self.cycling = not self.cycling
+
+        # Change interval time
+        elif key_in == ord('i') or key_in == ord('I'):
+            msg = 'Enter new Interval time: '
+            pad, max_y, width = len(msg)+2, self.max_line, 5
+            self.screen.addstr(max_y, 0, msg, self.highlight_color)  # Bottom of screen
+
+            # Create Textbox to get user input
+            editwin = curses.newwin(1, width, max_y, pad)
+            rectangle(self.screen, max_y-1, pad-1, max_y+1, pad+width)
+            self.screen.refresh()
+
+            box = Textbox(editwin)
+            box.edit()
+
+            # Set new interval time, if possible
+            with suppress(ValueError):
+                self.interval = float(box.gather())
 
 
 class CurseManager:
@@ -264,3 +296,4 @@ if __name__ == '__main__':
     cl_args = parser.parse_args()
     with CurseManager() as stdscr:
         PyWatch(stdscr, cl_args.command, cl_args.interval, cl_args.cycle_interval, cl_args.cycle).run()
+
